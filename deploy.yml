@@ -1,0 +1,207 @@
+- name: Update
+  hosts: servers
+  become: true
+  tasks:
+    - name: Update apt repo and cache on all Debian/Ubuntu boxes
+      ansible.builtin.apt: update_cache=yes force_apt_get=yes cache_valid_time=3600
+
+    - name: Upgrade all packages on servers
+      ansible.builtin.apt: upgrade=dist force_apt_get=yes
+
+    - name: Check if a reboot is needed on all servers
+      register: reboot_required_file
+      ansible.builtin.stat: path=/var/run/reboot-required get_md5=no
+
+    - name: Reboot the box if kernel updated
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by Ansible for kernel updates"
+        connect_timeout: 5
+        reboot_timeout: 300
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+        test_command: uptime
+      when: reboot_required_file.stat.exists
+
+- name: Configure firewall
+  hosts: servers
+  become: true
+  tasks:
+    - name: Allow ssh
+      community.general.ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: Ufw incoming policy
+      community.general.ufw:
+        state: enabled
+        policy: deny
+        direction: incoming
+
+    - name: Ufw outgoing policy
+      community.general.ufw:
+        state: enabled
+        policy: allow
+        direction: outgoing
+
+    - name: Allow http and api ports
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      with_items:
+        - 80
+        - 8080
+        - 8081
+
+- name: Install requirements
+  hosts: servers
+  become: true
+  tasks:
+    - name: Fetch nodejs
+      ansible.builtin.uri:
+        url: https://deb.nodesource.com/setup_18.x
+        return_content: true
+      register: nodejs_installer
+
+    - name: Install nodejs repo
+      ansible.builtin.shell:
+        cmd: bash -s --
+        stdin: "{{ nodejs_installer.content }}"
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+
+    - name: Add Docker GPG apt Key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker Repository
+      ansible.builtin.apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu jammy stable
+        state: present
+
+    - name: Update apt and install docker-ce
+      ansible.builtin.apt:
+        name: docker-ce
+        update_cache: true
+
+    - name: Get all packages
+      ansible.builtin.apt:
+        pkg:
+          - python3-pip
+          - supervisor
+          - nginx
+          - nodejs
+
+    - name: Upgrade pip
+      ansible.builtin.pip:
+        name: pip
+
+    - name: Update npm
+      community.general.npm:
+        name: npm
+        global: true
+        state: latest
+
+    - name: Install flask, gunicorn and docker
+      ansible.builtin.pip:
+        name: "{{ item }}"
+      with_items:
+        - flask
+        - gunicorn
+        - docker
+
+- name: Configure nginx
+  hosts: servers
+  become: true
+  tasks:
+    - name: Create nginx directory
+      ansible.builtin.file:
+        path: /var/www/test
+        state: directory
+        mode: '755'
+
+    - name: Create nginx vhost
+      ansible.builtin.copy:
+        src: nginx/test.vhost
+        dest: /etc/nginx/sites-available/default
+        force: true
+        mode: '755'
+
+    - name: Upload html file
+      ansible.builtin.copy:
+        src: nginx/index.html
+        dest: /var/www/test/
+        mode: '755'
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+        daemon_reload: true
+        enabled: true
+
+- name: Configure python api
+  hosts: servers
+  become: true
+  tasks:
+    - name: Upload flask api
+      ansible.builtin.copy:
+        src: python/api.py
+        dest: /root/
+        mode: '755'
+
+    - name: Upload supervisord config
+      ansible.builtin.copy:
+        src: python/api.conf
+        dest: /etc/supervisor/conf.d/
+        mode: '755'
+
+    - name: Restart supervisord
+      ansible.builtin.systemd:
+        name: supervisor
+        state: restarted
+        daemon_reload: true
+        enabled: true
+
+- name: Configure docker-node api
+  hosts: servers
+  become: true
+  tasks:
+    - name: Create docker directory
+      ansible.builtin.file:
+        path: /root/docker
+        state: directory
+        mode: '755'
+
+    - name: Upload files
+      ansible.builtin.copy:
+        src: node/{{ item }}
+        dest: /root/docker/
+        mode: '755'
+      with_items:
+        - Dockerfile
+        - .dockerignore
+        - index.js
+        - package.json
+
+    - name: Install npm express
+      community.general.npm:
+        name: express
+        path: /root/docker/
+
+    - name: Build image
+      community.docker.docker_image:
+        name: node-api
+        build:
+          path: /root/docker/
+        source: build
+
+    - name: Create container
+      community.docker.docker_container:
+        name: node-api
+        image: node-api
+        ports:
+          - 8081:3000
+        restart: true
+        restart_policy: unless-stopped
